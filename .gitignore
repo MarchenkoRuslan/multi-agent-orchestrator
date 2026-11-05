@@ -1,0 +1,17 @@
+node_modules/
+dist/
+build/
+.env
+.env.*
+!.env.example
+logs/
+*.log
+coverage/
+*.tsbuildinfo
+.reviews/
+.temp/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.claude/settings.local.json

@@ -1,0 +1,19 @@
+{
+  "name": "multi-agent-orchestrator",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["starter"],
+  "scripts": {
+    "build": "npm run build --workspace starter",
+    "test": "npm test --workspace starter",
+    "lint": "npm run lint --workspace starter",
+    "start": "npm start --workspace starter --",
+    "dev": "npm run dev --workspace starter --"
+  },
+  "devDependencies": {
+    "zod": "^3.25.76"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}
