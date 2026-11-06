@@ -6,6 +6,8 @@ import winston from 'winston';
  */
 export const logger = winston.createLogger({
   level: process.env.LOG_LEVEL || 'info',
+  // Vitest sets NODE_ENV=test; keep unit-test output clean.
+  silent: process.env.NODE_ENV === 'test',
   format: winston.format.combine(
     winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
     winston.format.errors({ stack: true }),
@@ -38,6 +40,15 @@ if (process.env.NODE_ENV !== 'production') {
       })
     )
   }));
+}
+
+/**
+ * Mute or restore console log output (file logs are unaffected), e.g. while a CLI spinner owns the terminal.
+ */
+export function setConsoleLogging(enabled: boolean): void {
+  for (const transport of logger.transports) {
+    if (transport instanceof winston.transports.Console) transport.silent = !enabled;
+  }
 }
 
 /**
@@ -80,11 +91,11 @@ export const logReviewError = (
   });
 };
 
-export const logAgentStart = (agentName: string, file: string) => {
-  logger.debug('Subagent starting', { agent: agentName, file });
+export const logAgentStart = (agentName: string, scope: string) => {
+  logger.info('Subagent starting', { agent: agentName, scope });
 };
 
-export const logAgentComplete = (agentName: string, file: string, duration: number) => {
-  logger.debug('Subagent completed', { agent: agentName, file, duration });
+export const logAgentComplete = (agentName: string, scope: string, duration: number, success = true) => {
+  logger.log(success ? 'info' : 'warn', 'Subagent completed', { agent: agentName, scope, duration, success });
 };
 

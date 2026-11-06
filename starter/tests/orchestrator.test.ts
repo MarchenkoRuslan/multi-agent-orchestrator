@@ -37,6 +37,8 @@ describe('CodeReviewOrchestrator', () => {
     const config = fake.execute.mock.calls[0] as unknown as [{ options: Record<string, unknown>; prompt: string }];
     expect(config[0].options).toMatchObject({ agents, settingSources: ['project'],
       tools: ['Task', 'Read', 'Grep', 'Glob', 'Skill'], outputFormat: { type: 'json_schema' } });
+    expect(config[0].options).toMatchObject({ env: { MCP_TIMEOUT: process.env.MCP_TIMEOUT ?? '120000' },
+      mcpServers: { eslint: { command: 'npx', env: { npm_config_prefer_offline: 'true' } } } });
     expect(config[0].prompt).toContain('parallel');
     const permission = config[0].options.canUseTool as (name: string, input: Record<string, unknown>) => Promise<{ behavior: string }>;
     expect(await permission('mcp__github__create_issue', {})).toMatchObject({ behavior: 'deny' });
@@ -50,6 +52,21 @@ describe('CodeReviewOrchestrator', () => {
     expect(Object.keys(report.metadata.agentVersions)).toEqual(Object.keys(agents));
     expect(orchestrator.rateLimiter.getStatus().activeRequests).toBe(0);
     expect(fake.close).toHaveBeenCalled();
+  });
+
+  it('reports live progress and stores a host-recorded execution trace in the report', async () => {
+    const fake = fakeQuery();
+    const events: Array<{ type: string; agent?: string }> = [];
+    const report = await new CodeReviewOrchestrator({ model: 'test', maxRetries: 0, queryFn: fake.queryFn,
+      snapshotLoader: async () => snapshot, onProgress: event => events.push(event) })
+      .reviewPullRequest('udacity', 'cd14715-simple-todo-app', 2);
+    expect(events.map(event => event.type)).toEqual(['snapshot-ready', 'agent-started', 'agent-started', 'agent-started',
+      'agent-completed', 'agent-completed', 'agent-completed', 'aggregating']);
+    expect(events.filter(event => event.type === 'agent-completed').map(event => event.agent)).toEqual(Object.keys(agents));
+    const trace = report.metadata.executionTrace ?? [];
+    expect(trace.filter(event => event.kind === 'call')).toEqual(Object.keys(agents).map(name =>
+      ({ from: 'orchestrator', to: name, label: 'Task', kind: 'call' })));
+    expect(trace.filter(event => event.kind === 'return').map(event => event.from)).toEqual(Object.keys(agents));
   });
 
   it('recalculates scores and counts instead of trusting model arithmetic', async () => {
@@ -88,23 +105,40 @@ describe('CodeReviewOrchestrator', () => {
       .rejects.toMatchObject({ cause: { code: 'STRUCTURED_OUTPUT_FAILED' } });
   });
 
-  it('aborts a stalled SDK session and releases its reservation', async () => {
+  it('aborts a stalled SDK session, releases its reservation, and does not retry the timeout', async () => {
     vi.useFakeTimers();
     let signal: AbortSignal | undefined;
     const close = vi.fn().mockResolvedValue({ done: true, value: undefined });
-    const queryFn = ((args: { options: { abortController: AbortController } }) => {
+    const queryFn = vi.fn((args: { options: { abortController: AbortController } }) => {
       signal = args.options.abortController.signal;
       return Object.assign((async function* () { await new Promise(() => {}); })(), { return: close });
-    }) as unknown as typeof query;
-    const orchestrator = new CodeReviewOrchestrator({ model: 'test', maxRetries: 0, timeoutMs: 100,
-      queryFn, snapshotLoader: async () => snapshot });
+    });
+    const orchestrator = new CodeReviewOrchestrator({ model: 'test', maxRetries: 1, timeoutMs: 100,
+      queryFn: queryFn as unknown as typeof query, snapshotLoader: async () => snapshot });
     const pending = orchestrator.reviewPullRequest('udacity', 'cd14715-simple-todo-app', 2);
-    const assertion = expect(pending).rejects.toMatchObject({ cause: { code: 'AGENT_TIMEOUT' } });
+    const assertion = expect(pending).rejects.toMatchObject({ code: 'AGENT_TIMEOUT',
+      message: expect.stringContaining('REVIEW_TIMEOUT_MINUTES') });
     await vi.advanceTimersByTimeAsync(100);
     await assertion;
+    expect(queryFn).toHaveBeenCalledTimes(1);
     expect(signal?.aborted).toBe(true);
     expect(close).toHaveBeenCalled();
     expect(orchestrator.rateLimiter.getStatus().activeRequests).toBe(0);
+  });
+
+  it('reports a retry through onProgress when an analysis attempt fails transiently', async () => {
+    const events: Array<{ type: string; attempt?: number }> = [];
+    let calls = 0;
+    const good = fakeQuery();
+    const queryFn = ((args: Parameters<typeof query>[0]) => {
+      calls += 1;
+      if (calls === 1) return Object.assign((async function* () { throw new Error('socket hang up'); })(),
+        { return: vi.fn().mockResolvedValue({ done: true, value: undefined }) });
+      return good.queryFn(args);
+    }) as typeof query;
+    await new CodeReviewOrchestrator({ model: 'test', maxRetries: 1, queryFn, snapshotLoader: async () => snapshot,
+      onProgress: event => events.push(event) }).reviewPullRequest('udacity', 'cd14715-simple-todo-app', 2);
+    expect(events.find(event => event.type === 'retrying')).toMatchObject({ attempt: 1, reason: expect.stringContaining('socket hang up') });
   });
 
   it('rejects invalid PR arguments before fetching anything', async () => {
@@ -140,8 +174,13 @@ describe('CodeReviewOrchestrator', () => {
   });
 
   it.runIf(process.env.RUN_LIVE_REVIEW === '1')('analyzes a real public PR through GitHub MCP and Claude', async () => {
-    const report = await new CodeReviewOrchestrator().reviewPullRequest('udacity', 'cd14715-simple-todo-app', 1);
+    // Integration case: fetches a real PR over the GitHub MCP snapshot server and runs all three subagents.
+    // Run with RUN_LIVE_REVIEW=1 (needs ANTHROPIC_API_KEY, ANTHROPIC_MODEL, PROJECT_ROOT; GITHUB_TOKEN recommended).
+    // LIVE_REVIEW_PR=octocat/Hello-World/1 targets the classic public sample PR instead of the assignment repo.
+    const [owner, repo, number] = (process.env.LIVE_REVIEW_PR ?? 'udacity/cd14715-simple-todo-app/1').split('/');
+    const report = await new CodeReviewOrchestrator().reviewPullRequest(owner!, repo!, Number(number));
     expect(report.fileReviews.length).toBeGreaterThan(0);
     expect(Object.keys(report.metadata.agentVersions)).toHaveLength(3);
+    expect(report.metadata.executionTrace?.some(event => event.label === 'Task')).toBe(true);
   }, 1200000);
 });

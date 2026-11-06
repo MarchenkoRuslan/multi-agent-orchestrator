@@ -41,6 +41,13 @@ export const ErrorCodes = {
 
 export type ErrorCode = typeof ErrorCodes[keyof typeof ErrorCodes];
 
+export interface RetryOptions {
+  /** Return false to rethrow this error immediately instead of retrying it. */
+  shouldRetry?: (error: unknown) => boolean;
+  /** Called before waiting for the next attempt (attempt is 1-based). */
+  onRetry?: (error: unknown, attempt: number) => void;
+}
+
 /**
  * Retry utility with exponential backoff
  *
@@ -59,13 +66,15 @@ export type ErrorCode = typeof ErrorCodes[keyof typeof ErrorCodes];
  * @param fn - Async function to retry
  * @param maxRetries - Maximum number of retries (default: 3)
  * @param delayMs - Base delay in milliseconds (default: 1000)
+ * @param options - Optional per-error retry decision and retry notification
  * @returns The result of the successful function execution
  * @throws ReviewError with RETRY_EXHAUSTED code if all retries fail
  */
 export async function withRetry<T>(
   fn: () => Promise<T>,
   maxRetries: number = 3,
-  delayMs: number = 1000
+  delayMs: number = 1000,
+  options: RetryOptions = {}
 ): Promise<T> {
   if (!Number.isInteger(maxRetries) || maxRetries < 0 || !Number.isFinite(delayMs) || delayMs < 0) {
     throw new ReviewError('Invalid retry configuration', ErrorCodes.INVALID_CONFIG);
@@ -80,7 +89,9 @@ export async function withRetry<T>(
         ErrorCodes.MISSING_API_KEY, ErrorCodes.PR_NOT_FOUND].includes(error.code as never)) {
         throw error;
       }
+      if (options.shouldRetry?.(error) === false) throw error;
       if (attempt < maxRetries) {
+        options.onRetry?.(error, attempt + 1);
         const delay = Math.min(delayMs * 2 ** attempt, 60000) + Math.random() * 100;
         await new Promise<void>(resolve => setTimeout(resolve, delay));
       }

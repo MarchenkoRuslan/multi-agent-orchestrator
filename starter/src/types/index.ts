@@ -23,6 +23,7 @@ export type {
 // Report schemas and types
 export {
   ReviewReportSchema,
-  ReviewReportJSONSchema
+  ReviewReportJSONSchema,
+  ExecutionTraceEventSchema
 } from './report-types.js';
-export type { ReviewReport } from './report-types.js';
+export type { ReviewReport, ExecutionTraceEvent } from './report-types.js';

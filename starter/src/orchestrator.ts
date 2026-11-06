@@ -1,4 +1,4 @@
-import { query } from '@anthropic-ai/claude-agent-sdk';
+import { query, type Options, type SDKMessage, type SDKResultMessage } from '@anthropic-ai/claude-agent-sdk';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ReviewReportSchema, ReviewReportJSONSchema, type ReviewReport } from './types/report-types.js';
@@ -6,8 +6,12 @@ import { codeQualityAnalyzer, testCoverageAnalyzer, refactoringSuggester } from 
 import { buildOrchestratorPrompt } from './prompts/index.js';
 import { createMcpServersConfig } from './config/mcp.config.js';
 import { fetchPullRequestSnapshot, type PullRequestSnapshot } from './mcp/snapshot.js';
-import { ErrorCodes, ReviewError, withRetry, withTimeout } from './utils/error-handler.js';
+import { ErrorCodes, ReviewError, formatError, withRetry, withTimeout } from './utils/error-handler.js';
+import { ExecutionTracker, type ProgressListener, type ReviewProgressEvent } from './utils/execution-tracker.js';
+import { logAgentComplete, logAgentStart, logger, logReviewComplete, logReviewError, logReviewStart } from './utils/logger.js';
 import { RateLimiter, type RateLimiterConfig } from './utils/rate-limiter.js';
+
+export type { ReviewProgressEvent, ProgressListener } from './utils/execution-tracker.js';
 
 /**
  * Orchestrator configuration options
@@ -20,6 +24,8 @@ export interface OrchestratorOptions {
   maxTurns?: number;
   maxBudgetUsd?: number;
   rateLimits?: Partial<RateLimiterConfig>;
+  /** Receives live progress (snapshot ready, agent started/completed, tool calls, aggregation). */
+  onProgress?: ProgressListener;
   queryFn?: typeof query;
   snapshotLoader?: typeof fetchPullRequestSnapshot;
 }
@@ -30,24 +36,68 @@ export const agents = {
   'refactoring-suggester': refactoringSuggester
 };
 
-const allowedTools = ['Task', 'Read', 'Grep', 'Glob', 'Skill', 'mcp__github__get_pull_request',
-  'mcp__github__get_pull_request_files', 'mcp__github__get_file_contents', 'mcp__eslint__lint-files'];
+const AGENT_VERSION = '1.0.0';
+const BUILT_IN_TOOLS = ['Task', 'Read', 'Grep', 'Glob', 'Skill'];
+/** Read-only tools from the connected GitHub and ESLint MCP servers. */
+const MCP_TOOLS = [
+  'mcp__github__get_pull_request',
+  'mcp__github__get_pull_request_files',
+  'mcp__github__get_file_contents',
+  'mcp__eslint__lint-files'
+];
+const allowedTools = [...BUILT_IN_TOOLS, ...MCP_TOOLS];
+const DISALLOWED_TOOLS = ['Bash', 'Write', 'Edit', 'NotebookEdit', 'WebFetch', 'WebSearch'];
 
+/** Live Claude reviews through shared proxies can take 10-25 minutes per PR. */
+const DEFAULT_TIMEOUT_MS = 30 * 60_000;
+/**
+ * Claude Code gives each MCP server 30 s to start; `npx -y @eslint/mcp` can take longer on Windows or a busy
+ * machine, and the server is then silently unavailable to the agents.
+ */
+const DEFAULT_MCP_STARTUP_TIMEOUT_MS = 120_000;
+const DEFAULT_MAX_TURNS = 80;
+const DEFAULT_MAX_BUDGET_USD = 2;
+const ESTIMATED_TOKENS_PER_REVIEW = 25_000;
+const SEVERITY_PENALTIES = { critical: 30, high: 15, medium: 7, low: 2, info: 0 } as const;
+const PRIORITY_RANK = { critical: 0, high: 1, medium: 2, low: 3 } as const;
+
+const sum = (values: number[]): number => values.reduce((total, value) => total + value, 0);
+
+/**
+ * Recomputes every score and count from the findings instead of trusting model arithmetic.
+ */
 export function aggregateReport(report: ReviewReport): ReviewReport {
-  const penalties = { critical: 30, high: 15, medium: 7, low: 2, info: 0 };
   for (const review of report.fileReviews) {
-    review.codeQuality.overallScore = Math.max(0, 100 - review.codeQuality.issues.reduce((sum, issue) => sum + penalties[issue.severity], 0));
+    const penalty = sum(review.codeQuality.issues.map(issue => SEVERITY_PENALTIES[issue.severity]));
+    review.codeQuality.overallScore = Math.max(0, 100 - penalty);
   }
+  const reviews = report.fileReviews;
   report.summary = {
-    totalFiles: report.fileReviews.length,
-    overallScore: report.fileReviews.length ? Math.round(report.fileReviews.reduce((sum, review) => sum + review.codeQuality.overallScore, 0) / report.fileReviews.length) : 0,
-    criticalIssues: report.fileReviews.reduce((sum, review) => sum + review.codeQuality.issues.filter(issue => issue.severity === 'critical').length, 0),
-    highPriorityTests: report.fileReviews.reduce((sum, review) => sum + review.testCoverage.untestedPaths.filter(path => path.priority === 'critical' || path.priority === 'high').length, 0),
-    refactoringOpportunities: report.fileReviews.reduce((sum, review) => sum + review.refactorings.suggestions.length, 0)
+    totalFiles: reviews.length,
+    overallScore: reviews.length ? Math.round(sum(reviews.map(review => review.codeQuality.overallScore)) / reviews.length) : 0,
+    criticalIssues: sum(reviews.map(review =>
+      review.codeQuality.issues.filter(issue => issue.severity === 'critical').length)),
+    highPriorityTests: sum(reviews.map(review =>
+      review.testCoverage.untestedPaths.filter(path => path.priority === 'critical' || path.priority === 'high').length)),
+    refactoringOpportunities: sum(reviews.map(review => review.refactorings.suggestions.length))
   };
-  const rank = { critical: 0, high: 1, medium: 2, low: 3 };
-  report.recommendations.sort((first, second) => rank[first.priority] - rank[second.priority]);
+  report.recommendations.sort((first, second) => PRIORITY_RANK[first.priority] - PRIORITY_RANK[second.priority]);
   return report;
+}
+
+function redactSecrets(text: string): string {
+  let redacted = text;
+  for (const secret of [process.env.ANTHROPIC_API_KEY, process.env.GITHUB_TOKEN]) {
+    if (secret) redacted = redacted.split(secret).join('[REDACTED]');
+  }
+  return redacted;
+}
+
+/** Converts an unsuccessful SDK result into an actionable error; credential/config problems are not retried. */
+function sessionFailure(message: SDKResultMessage): ReviewError {
+  const detail = redactSecrets(message.subtype === 'success' ? message.result : message.errors.join('; '));
+  const code = /API Error:\s*(400|401|403|404)\b/.test(detail) ? ErrorCodes.INVALID_CONFIG : ErrorCodes.AGENT_FAILED;
+  return new ReviewError(`Claude review failed (${message.subtype}): ${detail.slice(0, 1500)}`, code);
 }
 
 /**
@@ -57,6 +107,7 @@ export function aggregateReport(report: ReviewReport): ReviewReport {
 export class CodeReviewOrchestrator {
   readonly rateLimiter: RateLimiter;
   private readonly options: OrchestratorOptions;
+
   constructor(options: OrchestratorOptions = {}) {
     this.options = options;
     this.rateLimiter = new RateLimiter(options.rateLimits);
@@ -74,118 +125,155 @@ export class CodeReviewOrchestrator {
     repo: string,
     prNumber: number
   ): Promise<ReviewReport> {
-    if (!/^[\w-]+$/.test(owner) || !/^[\w.-]+$/.test(repo) || repo === '.' || repo === '..' ||
-      !Number.isSafeInteger(prNumber) || prNumber <= 0) {
+    const validRepository = /^[\w-]+$/.test(owner) && /^[\w.-]+$/.test(repo) && repo !== '.' && repo !== '..';
+    if (!validRepository || !Number.isSafeInteger(prNumber) || prNumber <= 0) {
       throw new ReviewError('Expected a valid GitHub owner, repository, and positive PR number', ErrorCodes.VALIDATION_FAILED);
     }
     const model = this.options.model ?? process.env.ANTHROPIC_MODEL;
     if (!model?.trim()) throw new ReviewError('ANTHROPIC_MODEL is required', ErrorCodes.INVALID_CONFIG);
-    const projectRoot = resolve(this.options.projectRoot ?? process.env.PROJECT_ROOT ?? fileURLToPath(new URL('..', import.meta.url)));
+    const projectRoot = resolve(this.options.projectRoot ?? process.env.PROJECT_ROOT ??
+      fileURLToPath(new URL('..', import.meta.url)));
+    const maxRetries = this.options.maxRetries ?? 1;
     const started = Date.now();
-    const snapshot = await withRetry(() => (this.options.snapshotLoader ?? fetchPullRequestSnapshot)(owner, repo, prNumber, projectRoot),
-      this.options.maxRetries ?? 1);
-    const report = await withRetry(() => this.analyze(owner, repo, prNumber, model, snapshot), this.options.maxRetries ?? 1);
-    report.metadata.analyzedAt = new Date().toISOString();
-    report.metadata.duration = Date.now() - started;
-    return ReviewReportSchema.parse(aggregateReport(report));
+
+    logReviewStart(owner, repo, prNumber);
+    try {
+      const loadSnapshot = this.options.snapshotLoader ?? fetchPullRequestSnapshot;
+      const snapshot = await withRetry(() => loadSnapshot(owner, repo, prNumber, projectRoot), maxRetries);
+      this.emitProgress({ type: 'snapshot-ready', files: snapshot.files.length, title: snapshot.title }, snapshot);
+
+      const report = await withRetry(() => this.analyze(owner, repo, prNumber, model, snapshot), maxRetries, 1000, {
+        // A whole-session timeout is not transient: retrying would double the wait and the cost.
+        shouldRetry: error => !(error instanceof ReviewError && error.code === ErrorCodes.AGENT_TIMEOUT),
+        onRetry: (error, attempt) =>
+          this.emitProgress({ type: 'retrying', attempt, reason: redactSecrets(formatError(error)).slice(0, 300) }, snapshot)
+      });
+      report.metadata.analyzedAt = new Date().toISOString();
+      report.metadata.duration = Date.now() - started;
+      const finalReport = ReviewReportSchema.parse(aggregateReport(report));
+      logReviewComplete(owner, repo, prNumber, finalReport.summary.overallScore, finalReport.metadata.duration);
+      return finalReport;
+    } catch (error) {
+      logReviewError(owner, repo, prNumber, error instanceof Error ? error : new Error(String(error)));
+      throw error;
+    }
   }
 
-  private async analyze(owner: string, repo: string, prNumber: number, model: string, snapshot: PullRequestSnapshot): Promise<ReviewReport> {
+  private emitProgress(event: ReviewProgressEvent, snapshot: PullRequestSnapshot): void {
+    const scope = `${snapshot.files.length} changed file(s)`;
+    if (event.type === 'agent-started') logAgentStart(event.agent, scope);
+    else if (event.type === 'agent-completed') logAgentComplete(event.agent, scope, event.durationMs, event.success);
+    else if (event.type === 'tool-call') logger.debug('Tool call', { actor: event.actor, target: event.target, tool: event.label });
+    else if (event.type === 'retrying') logger.warn('Retrying PR analysis', { attempt: event.attempt, reason: event.reason });
+    this.options.onProgress?.(event);
+  }
+
+  private buildQueryOptions(model: string, snapshot: PullRequestSnapshot, abortController: AbortController): Options {
+    return {
+      cwd: snapshot.directory,
+      model,
+      abortController,
+      agents,
+      mcpServers: createMcpServersConfig(),
+      env: { ...process.env, MCP_TIMEOUT: process.env.MCP_TIMEOUT ?? String(DEFAULT_MCP_STARTUP_TIMEOUT_MS) },
+      settingSources: ['project'],
+      tools: BUILT_IN_TOOLS,
+      allowedTools,
+      canUseTool: async (name, input) => allowedTools.includes(name)
+        ? { behavior: 'allow', updatedInput: input }
+        : { behavior: 'deny', message: 'Only read-only review tools are permitted.' },
+      disallowedTools: DISALLOWED_TOOLS,
+      permissionMode: 'default',
+      maxTurns: this.options.maxTurns ?? DEFAULT_MAX_TURNS,
+      maxBudgetUsd: this.options.maxBudgetUsd ?? DEFAULT_MAX_BUDGET_USD,
+      outputFormat: { type: 'json_schema', schema: ReviewReportJSONSchema }
+    };
+  }
+
+  private async analyze(
+    owner: string,
+    repo: string,
+    prNumber: number,
+    model: string,
+    snapshot: PullRequestSnapshot
+  ): Promise<ReviewReport> {
     const controller = new AbortController();
-    const requestId = await this.rateLimiter.acquire(Math.min(25000, this.options.rateLimits?.maxTokensPerMinute ?? 100000));
-    const invoked = new Set<string>();
-    const completed = new Set<string>();
-    const tasks = new Map<string, string>();
-    let actualTokens: number | undefined;
+    const estimatedTokens = Math.min(ESTIMATED_TOKENS_PER_REVIEW, this.options.rateLimits?.maxTokensPerMinute ?? 100_000);
+    const requestId = await this.rateLimiter.acquire(estimatedTokens);
+    const tracker = new ExecutionTracker(Object.keys(agents), event => this.emitProgress(event, snapshot));
+    const usage: { tokens?: number } = {};
     let stream: ReturnType<typeof query> | undefined;
     try {
       stream = (this.options.queryFn ?? query)({
-      prompt: buildOrchestratorPrompt(owner, repo, prNumber, JSON.stringify(snapshot)),
-      options: {
-        cwd: snapshot.directory,
-        model,
-        abortController: controller,
-        agents,
-        mcpServers: createMcpServersConfig(),
-        settingSources: ['project'],
-        tools: ['Task', 'Read', 'Grep', 'Glob', 'Skill'],
-        allowedTools,
-        canUseTool: async (name, input) => allowedTools.includes(name) ?
-          { behavior: 'allow', updatedInput: input } : { behavior: 'deny', message: 'Only read-only review tools are permitted.' },
-        disallowedTools: ['Bash', 'Write', 'Edit', 'NotebookEdit', 'WebFetch', 'WebSearch'],
-        permissionMode: 'default',
-        maxTurns: this.options.maxTurns ?? 80,
-        maxBudgetUsd: this.options.maxBudgetUsd ?? 2,
-        outputFormat: { type: 'json_schema', schema: ReviewReportJSONSchema }
-      }
+        prompt: buildOrchestratorPrompt(owner, repo, prNumber, JSON.stringify(snapshot)),
+        options: this.buildQueryOptions(model, snapshot, controller)
       });
       const session = stream;
-      return await withTimeout(async () => {
-        for await (const message of session) {
-          if (message.type === 'assistant') {
-            for (const block of message.message.content) {
-              if (block.type === 'tool_use' && block.name === 'Task') {
-                const input = block.input as { subagent_type?: string };
-                if (input.subagent_type && input.subagent_type in agents) {
-                  invoked.add(input.subagent_type);
-                  tasks.set(block.id, input.subagent_type);
-                }
-              }
-            }
-          }
-          if (message.type === 'user' && Array.isArray(message.message.content)) {
-            for (const block of message.message.content) {
-              if (block.type === 'tool_result' && !block.is_error) {
-                const name = tasks.get(block.tool_use_id);
-                if (name) completed.add(name);
-              }
-            }
-          }
-          if (message.type !== 'result') continue;
-          if (message.subtype !== 'success' || message.is_error) {
-            let detail = message.subtype === 'success' ? message.result : message.errors.join('; ');
-            for (const secret of [process.env.ANTHROPIC_API_KEY, process.env.GITHUB_TOKEN]) {
-              if (secret) detail = detail.split(secret).join('[REDACTED]');
-            }
-            const code = /API Error:\s*(400|401|403|404)\b/.test(detail) ? ErrorCodes.INVALID_CONFIG : ErrorCodes.AGENT_FAILED;
-            throw new ReviewError(`Claude review failed (${message.subtype}): ${detail.slice(0, 1500)}`, code);
-          }
-          actualTokens = message.usage.input_tokens + message.usage.output_tokens;
-          if (Object.keys(agents).some(name => !invoked.has(name) || !completed.has(name))) {
-            throw new ReviewError('Not all three specialist Tasks completed successfully', ErrorCodes.AGENT_FAILED);
-          }
-          const parsed = ReviewReportSchema.safeParse(message.structured_output);
-          if (!parsed.success) throw new ReviewError('Claude returned an invalid ReviewReport', ErrorCodes.STRUCTURED_OUTPUT_FAILED,
-            { validation: parsed.error.flatten() });
-          this.validateEvidence(parsed.data, owner, repo, prNumber, snapshot);
-          parsed.data.metadata.agentVersions = Object.fromEntries(Object.keys(agents).map(name => [name, '1.0.0']));
-          return parsed.data;
-        }
-        throw new ReviewError('Claude session ended without a structured report', ErrorCodes.STRUCTURED_OUTPUT_FAILED);
-      }, this.options.timeoutMs ?? 900000, 'PR analysis timed out; SDK session cancelled');
+      const timeoutMs = this.options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+      return await withTimeout(
+        () => this.consumeSession(session, tracker, usage, { owner, repo, number: prNumber }, snapshot),
+        timeoutMs,
+        `PR analysis timed out after ${Math.round(timeoutMs / 60_000)} minute(s); SDK session cancelled. ` +
+          'Set REVIEW_TIMEOUT_MINUTES to allow longer reviews.'
+      );
     } finally {
       controller.abort();
       if (stream) void stream.return(undefined).catch(() => {});
-      this.rateLimiter.release(actualTokens, requestId);
+      this.rateLimiter.release(usage.tokens, requestId);
     }
   }
 
-  private validateEvidence(report: ReviewReport, owner: string, repo: string, prNumber: number, snapshot: PullRequestSnapshot): void {
-    const expected = new Map(snapshot.files.map(file => [file.file, file.lineCount]));
-    const seen = new Set<string>();
-    if (report.pullRequest.owner !== owner || report.pullRequest.repo !== repo || report.pullRequest.number !== prNumber) {
+  private async consumeSession(
+    session: AsyncIterable<SDKMessage>,
+    tracker: ExecutionTracker,
+    usage: { tokens?: number },
+    pullRequest: ReviewReport['pullRequest'],
+    snapshot: PullRequestSnapshot
+  ): Promise<ReviewReport> {
+    for await (const message of session) {
+      tracker.handle(message);
+      if (message.type !== 'result') continue;
+      if (message.subtype !== 'success' || message.is_error) throw sessionFailure(message);
+      usage.tokens = message.usage.input_tokens + message.usage.output_tokens;
+
+      const missing = tracker.missingAgents();
+      if (missing.length) {
+        throw new ReviewError(`Specialist Tasks did not complete successfully: ${missing.join(', ')}`, ErrorCodes.AGENT_FAILED);
+      }
+      this.emitProgress({ type: 'aggregating' }, snapshot);
+      const parsed = ReviewReportSchema.safeParse(message.structured_output);
+      if (!parsed.success) {
+        throw new ReviewError('Claude returned an invalid ReviewReport', ErrorCodes.STRUCTURED_OUTPUT_FAILED,
+          { validation: parsed.error.flatten() });
+      }
+      this.validateEvidence(parsed.data, pullRequest, snapshot);
+      parsed.data.metadata.agentVersions = Object.fromEntries(Object.keys(agents).map(name => [name, AGENT_VERSION]));
+      parsed.data.metadata.executionTrace = tracker.trace;
+      return parsed.data;
+    }
+    throw new ReviewError('Claude session ended without a structured report', ErrorCodes.STRUCTURED_OUTPUT_FAILED);
+  }
+
+  /** Ensures the report covers exactly the changed files of the requested PR with in-range line evidence. */
+  private validateEvidence(report: ReviewReport, expectedPr: ReviewReport['pullRequest'], snapshot: PullRequestSnapshot): void {
+    const { owner, repo, number } = report.pullRequest;
+    if (owner !== expectedPr.owner || repo !== expectedPr.repo || number !== expectedPr.number) {
       throw new ReviewError('Report identifies the wrong pull request', ErrorCodes.STRUCTURED_OUTPUT_FAILED);
     }
+    const lineCounts = new Map(snapshot.files.map(file => [file.file, file.lineCount]));
+    const seen = new Set<string>();
     for (const review of report.fileReviews) {
-      const maxLine = expected.get(review.file);
-      if (!maxLine || seen.has(review.file) || [review.codeQuality.file, review.testCoverage.file, review.refactorings.file].some(file => file !== review.file) ||
-        review.codeQuality.issues.some(issue => issue.line > maxLine)) {
-        throw new ReviewError(`Invalid or duplicate file evidence: ${review.file}`, ErrorCodes.STRUCTURED_OUTPUT_FAILED);
-      }
+      const maxLine = lineCounts.get(review.file);
+      const sectionFiles = [review.codeQuality.file, review.testCoverage.file, review.refactorings.file];
+      const invalid = !maxLine || seen.has(review.file) || sectionFiles.some(file => file !== review.file) ||
+        review.codeQuality.issues.some(issue => issue.line > maxLine);
+      if (invalid) throw new ReviewError(`Invalid or duplicate file evidence: ${review.file}`, ErrorCodes.STRUCTURED_OUTPUT_FAILED);
       seen.add(review.file);
     }
-    if (seen.size !== expected.size || report.recommendations.some(rec => rec.files.some(file => !expected.has(file)))) {
-      throw new ReviewError('Report omits changed files or references unknown recommendation paths', ErrorCodes.STRUCTURED_OUTPUT_FAILED);
+    const unknownPaths = report.recommendations.some(rec => rec.files.some(file => !lineCounts.has(file)));
+    if (seen.size !== lineCounts.size || unknownPaths) {
+      throw new ReviewError('Report omits changed files or references unknown recommendation paths',
+        ErrorCodes.STRUCTURED_OUTPUT_FAILED);
     }
   }
 }

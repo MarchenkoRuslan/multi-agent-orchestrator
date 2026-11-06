@@ -33,9 +33,15 @@ export const mcpServersConfig = {
   }
 } satisfies Record<string, McpServerConfig>;
 
+/** Lets npx start the locally installed MCP packages without waiting on registry checks. */
+const NPX_ENV = { npm_config_prefer_offline: 'true', npm_config_update_notifier: 'false' };
+
 export function createMcpServersConfig(): Record<string, McpServerConfig> {
-  return { ...mcpServersConfig, github: { ...mcpServersConfig.github,
-    env: { GITHUB_PERSONAL_ACCESS_TOKEN: process.env.GITHUB_TOKEN ?? '' } } };
+  return {
+    github: { ...mcpServersConfig.github,
+      env: { ...NPX_ENV, GITHUB_PERSONAL_ACCESS_TOKEN: process.env.GITHUB_TOKEN ?? '' } },
+    eslint: { ...mcpServersConfig.eslint, env: { ...NPX_ENV } }
+  };
 }
 
 export function createSnapshotServerConfig() {

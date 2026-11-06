@@ -50,3 +50,6 @@ For each issue provide:
 3. Fix with code example
 4. Severity level
 
+This skill is guidance only: after applying it, continue your remaining steps and return findings
+in the exact output format required by your agent instructions (for example a JSON array).
+

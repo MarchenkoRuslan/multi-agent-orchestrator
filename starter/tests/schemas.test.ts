@@ -40,6 +40,15 @@ describe('analysis and report schemas', () => {
     expect(RefactoringSuggestionSchema.safeParse({ file: '', suggestions: [], summary: '' }).success).toBe(false);
   });
 
+  it('accepts a host-recorded execution trace but keeps it out of the model-facing JSON schema', () => {
+    const traced = { ...validReport, metadata: { ...validReport.metadata,
+      executionTrace: [{ from: 'orchestrator', to: 'code-quality-analyzer', label: 'Task', kind: 'call' }] } };
+    expect(ReviewReportSchema.safeParse(traced).success).toBe(true);
+    expect(ReviewReportSchema.safeParse({ ...traced, metadata: { ...traced.metadata,
+      executionTrace: [{ from: 'orchestrator', to: '', label: 'Task', kind: 'jump' }] } }).success).toBe(false);
+    expect(JSON.stringify(ReviewReportJSONSchema)).not.toContain('executionTrace');
+  });
+
   it('exports usable JSON schemas with resolved references for structured output', () => {
     const ajv = new Ajv({ strict: false, validateFormats: false });
     for (const [schema, value] of [
@@ -52,5 +61,17 @@ describe('analysis and report schemas', () => {
       expect(validate(value), JSON.stringify(validate.errors)).toBe(true);
       expect(validate({})).toBe(false);
     }
+  });
+
+  it('compiles the structured-output schema exactly as Claude Code does', () => {
+    // Claude Code builds its StructuredOutput tool with `new Ajv({ allErrors: true })` (strict, no format plugins)
+    // and silently drops the tool if compilation throws, leaving the model to answer in free text.
+    const ajv = new Ajv({ allErrors: true });
+    expect(ajv.validateSchema(ReviewReportJSONSchema)).toBe(true);
+    const validate = ajv.compile(ReviewReportJSONSchema);
+    expect(validate(validReport), JSON.stringify(validate.errors)).toBe(true);
+    expect(JSON.stringify(ReviewReportJSONSchema)).not.toContain('"format"');
+    expect(ReviewReportSchema.safeParse({ ...validReport, metadata: { ...validReport.metadata, analyzedAt: 'yesterday' } }).success)
+      .toBe(false);
   });
 });

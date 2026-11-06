@@ -6,34 +6,18 @@ This directory contains Claude Skills - reusable domain expertise that agents ca
 
 Skills are markdown files that provide Claude with specialized knowledge for specific tasks. They're loaded automatically by the Claude Agent SDK when agents invoke them.
 
-## Provided Example
+## Available Skills
 
-- **javascript-best-practices/** - Complete example skill for JavaScript code review
-  - Review this to understand the skill format
-  - See how it provides best practices, common pitfalls, and output format
+| Skill | Used by | When |
+| --- | --- | --- |
+| `javascript-best-practices` | code-quality-analyzer, refactoring-suggester | `.js`, `.jsx`, `.mjs`, `.cjs` files (provided example) |
+| `typescript-patterns` | code-quality-analyzer, refactoring-suggester, test-coverage-analyzer | `.ts`, `.tsx`, `.mts`, `.cts` files |
+| `security-analysis` | code-quality-analyzer | Every changed source file (trust boundaries, injection, payments, auth) |
+| `test-analysis` | test-coverage-analyzer | Every changed source file (static coverage, assertions, test gaps) |
+| `refactoring-analysis` | refactoring-suggester | Every changed source file (extractions, deduplication, patterns) |
 
-## Your Task
-
-Create **3 additional skills** (minimum 2 required):
-
-### Required Skills
-
-1. **typescript-patterns/** - TypeScript-specific analysis
-   - Type safety best practices
-   - Advanced TypeScript patterns
-   - Common type issues
-
-2. **security-analysis/** - Security-focused code review
-   - OWASP Top 10 vulnerabilities
-   - Secure coding practices
-   - Common security mistakes
-
-### Optional Skills (Choose 1+)
-
-3. **python-code-review/** - Python idioms and patterns
-4. **performance-optimization/** - Performance analysis
-5. **accessibility/** - Web accessibility (for frontend code)
-6. **Your custom skill** - Any domain expertise you want to add
+The agent prompts in `src/prompts/` contain the exact file-type mapping. Each review copies this
+directory into the isolated snapshot so only these trusted skills are available to the agents.
 
 ## Skill File Structure
 
@@ -41,14 +25,11 @@ Each skill must be in its own folder with a `SKILL.md` file:
 
 ```
 .claude/skills/
-├── javascript-best-practices/
-│   └── SKILL.md               ✅ Provided example
-├── typescript-patterns/
-│   └── SKILL.md               TODO: Create
-├── security-analysis/
-│   └── SKILL.md               TODO: Create
-└── python-code-review/
-    └── SKILL.md               TODO: Create
+├── javascript-best-practices/SKILL.md
+├── typescript-patterns/SKILL.md
+├── security-analysis/SKILL.md
+├── test-analysis/SKILL.md
+└── refactoring-analysis/SKILL.md
 ```
 
 ## SKILL.md Format

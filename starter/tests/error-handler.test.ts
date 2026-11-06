@@ -30,6 +30,20 @@ describe('retry and timeout', () => {
     expect(operation).toHaveBeenCalledTimes(1);
   });
 
+  it('lets callers veto retries per error and observe each retry', async () => {
+    vi.useFakeTimers();
+    const onRetry = vi.fn();
+    const shouldRetry = (error: unknown) => !(error instanceof ReviewError && error.code === ErrorCodes.AGENT_TIMEOUT);
+    const timeout = new ReviewError('slow', ErrorCodes.AGENT_TIMEOUT);
+    const operation = vi.fn().mockRejectedValueOnce(new Error('temporary')).mockRejectedValue(timeout);
+    const pending = withRetry(operation, 3, 100, { shouldRetry, onRetry });
+    const assertion = expect(pending).rejects.toBe(timeout);
+    await vi.advanceTimersByTimeAsync(200);
+    await assertion;
+    expect(operation).toHaveBeenCalledTimes(2);
+    expect(onRetry).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ message: 'temporary' }), 1);
+  });
+
   it('times out stalled work and cleans up timers', async () => {
     vi.useFakeTimers();
     const pending = withTimeout(() => new Promise(() => {}), 100);

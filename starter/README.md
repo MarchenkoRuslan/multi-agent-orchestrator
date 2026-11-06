@@ -5,10 +5,15 @@ Multi-agent pull request reviews using the Claude Agent SDK, GitHub MCP, ESLint 
 ## Implemented Workflow
 
 1. A bundled read-only snapshot MCP server fetches the PR, paginated changed files, source tree, and UTF-8 contents at exact head/base commits.
-2. The host writes an isolated snapshot under `.reviews/`, with trusted Skills and a trusted ESLint configuration.
+2. The host writes an isolated snapshot under `.reviews/`, with trusted Skills and a trusted ESLint configuration
+   (a curated rule set such as `no-eval` and `eqeqeq` for JavaScript, plus the `typescript-eslint` parser and `@typescript-eslint` rules for TypeScript).
 3. Claude connects to the configured GitHub/ESLint MCP packages and dispatches three `Task` specialists for quality, static test coverage, and refactoring. All inherit the configured model.
-4. The host checks successful specialist completion, report schemas, exact file coverage, and issue line bounds, then recomputes scores and counts.
-5. JSON, Markdown, and escaped HTML reports are written under `reports/`. Reports are included in version control; snapshots and credentials are not.
+   Each specialist prompt maps file types to Skills: `security-analysis` for every file, `typescript-patterns` for `.ts/.tsx`,
+   `javascript-best-practices` for `.js/.jsx/.mjs/.cjs`, plus `test-analysis` and `refactoring-analysis` for the respective agents.
+4. The host records an execution trace of every `Task`, `Skill`, file and MCP tool call, attributed per agent, and shows live progress in the terminal.
+5. The host checks successful specialist completion, report schemas, exact file coverage, and issue line bounds, then recomputes scores and counts.
+6. JSON, Markdown, and escaped HTML reports are written under `reports/`, including a tool-usage table and a Mermaid sequence diagram of the trace.
+   Reports are included in version control; snapshots and credentials are not.
 
 Use Node.js 22.13 or newer. From the repository root:
 
@@ -36,12 +41,36 @@ npm start -- udacity cd14715-simple-todo-app 2 --output reports
 ```
 
 Report names are `udacity_cd14715-simple-todo-app_N.{json,md,html}`. Open HTML files directly in a browser; no server is required.
+The HTML trace diagram is rendered by a pinned, integrity-checked Mermaid script; the Markdown diagram renders natively on GitHub.
 `npm run dev -- ...` is also supported through `tsx`. The regular test suite uses a mocked SDK with real schema/report processing;
-the opt-in live test requires `RUN_LIVE_REVIEW=1`, credentials, model, and project-root variables. Live runs incur API charges.
+the opt-in live test requires `RUN_LIVE_REVIEW=1`, credentials, model, and project-root variables. It reviews
+`udacity/cd14715-simple-todo-app` PR 1 by default; `LIVE_REVIEW_PR=octocat/Hello-World/1` targets the classic public sample PR.
+Live runs incur API charges.
+
+### Additional Features
+
+- **Progress:** in an interactive terminal an ora spinner shows the current tool call with elapsed time, and a
+  `PR #2 [##-] 2/3 agents` line is printed as each specialist starts or finishes. When output is piped or in CI
+  (no TTY), plain lines are written instead: every tool call, agent start/finish, retries and a
+  `... still working, 2m 30s elapsed` heartbeat every 30 seconds, so a slow model never looks like a hung terminal.
+  Winston console output is muted while the spinner is active; file logs under `logs/` are unaffected.
+- **PR comment:** `npm start -- <owner> <repo> <pr> --post-comment` posts a summary comment through the GitHub MCP `add_issue_comment` tool.
+  It requires `GITHUB_TOKEN` with comment permission, fails before any review when the token is missing, and is mocked in tests.
+- **Golden regression suite:** `npm run eval [reportsDir]` checks generated reports against known defects of the assignment PRs
+  (SQL injection at `src/todo.ts` lines 121/132/143 within 3 lines, untested payment functions in `src/premium.ts`, no critical
+  issues in the clean control). `tests/golden.test.ts` runs the same checks over committed reports.
 
 ### Reliability and Limits
 
-- Reviews retry once by default, cancel the SDK after 15 minutes, allow 80 turns, and cap each SDK session at USD 2 (provider billing may vary).
+- Reviews retry transient failures once by default, allow 80 turns, and cap each SDK session at USD 2 (provider billing may vary).
+  Each SDK session is cancelled after 30 minutes (`REVIEW_TIMEOUT_MINUTES`, 1-240); a timeout is not retried because
+  repeating a slow review would only double its cost.
+- Skills are guidance only: every SKILL.md and specialist prompt states that the agent must continue its steps and finish with the
+  JSON contract. `tests/skills.test.ts` also rejects `` !` `` in skills, which Claude Code would run as a shell command on load.
+- MCP servers get 120 seconds to start (`MCP_TIMEOUT` in milliseconds overrides it). Claude Code's default of 30 seconds is
+  shorter than a cold `npx -y @eslint/mcp` start on Windows, which left the ESLint tool silently unavailable.
+- The structured-output JSON Schema omits `format` keywords: Claude Code compiles it with strict Ajv and silently drops the
+  `StructuredOutput` tool if compilation fails. Zod still validates the full report, including `analyzedAt`, on the host.
 - Failed or missing specialists cause explicit failure, never invented success. Snapshots remain available for diagnosis.
 - Coverage is a static estimate, not executed coverage. No repository code, tests, install scripts, plugins, or lint configuration are executed.
 - Quality scores start at 100 and subtract 30/15/7/2/0 for critical/high/medium/low/info issues; overall score is the rounded per-file mean.
@@ -55,13 +84,18 @@ the opt-in live test requires `RUN_LIVE_REVIEW=1`, credentials, model, and proje
 
 ### Submission Status
 
-The local suite checks schema validation, retry/backoff, timeouts, sliding-window limits, SDK failures,
-real MCP subprocess handshakes, and generation of all nine required filenames using mocked agent results
-in a temporary directory. These tests are not evidence of completed live Claude analysis.
+All nine assignment reports in `reports/` come from live runs (Claude Sonnet 4.5 via the Claude Agent SDK, GitHub MCP for PR data,
+ESLint MCP and Claude Skills inside the specialists). Each PR was reviewed with `npm start -- udacity cd14715-simple-todo-app <N>`.
 
-The live PR analysis was blocked by the configured provider response: "Key access is suspended."
-Restore course access or configure a personal Anthropic key locally before running the three required PRs.
-No placeholder reports are included as submission deliverables. All nine populated live reports are still required.
+| PR | Changed file | Score | Code-quality findings | Test coverage | Refactorings | Trace events | Duration |
+|----|--------------|-------|-----------------------|---------------|--------------|--------------|----------|
+| 1 | `fixtures/clean-code.ts` (clean control) | 82 | 2 medium, 2 low, 2 info; no critical/high | no tests, 9 untested paths | 6 | 25 | 12.1 min |
+| 2 | `src/todo.ts` | 0 | 3 critical SQL injections at lines 121, 132, 143; 1 high, 7 medium | 15% estimate, 11 untested paths | 6 | 28 | 14.7 min |
+| 3 | `src/premium.ts` | 0 | 2 critical, 4 high, 8 medium | no tests, 14 untested paths incl. all 5 payment functions | 7 | 33 | 19.5 min |
+
+`npm run eval` passes 3/3 golden cases on these reports, and `tests/golden.test.ts` repeats the checks in `npm test`.
+The local suite also covers schema validation, retry/backoff, timeouts, sliding-window limits, SDK failures, real MCP
+subprocess handshakes, and report generation with mocked agent results.
 
 ## Original Starter Guide
 

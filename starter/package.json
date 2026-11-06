@@ -15,6 +15,7 @@
     "start": "node dist/main.js",
     "test": "vitest run",
     "test:watch": "vitest",
+    "eval": "tsx src/eval/run-eval.ts",
     "lint": "tsc --noEmit"
   },
   "keywords": [
@@ -27,10 +28,12 @@
   "license": "ISC",
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.1.55",
+    "@eslint/mcp": "^0.2.0",
     "@modelcontextprotocol/sdk": "^1.23.0",
     "@modelcontextprotocol/server-github": "2025.4.8",
-    "@eslint/mcp": "^0.2.0",
     "dotenv": "^16.0.0",
+    "ora": "^8.2.0",
+    "typescript-eslint": "^8.72.1",
     "winston": "^3.11.0",
     "zod": "^3.25.76",
     "zod-to-json-schema": "^3.22.0"

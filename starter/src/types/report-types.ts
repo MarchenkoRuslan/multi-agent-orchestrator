@@ -7,10 +7,29 @@ import {
 } from './analysis-results.js';
 
 /**
- * Complete Review Report Schema
- * Aggregates all subagent results into a unified report
+ * One observed step of the multi-agent session, recorded by the orchestrator from SDK messages
+ * (never produced by the model). `call` is a tool invocation; `return` is a subagent handing back results.
  */
-export const ReviewReportSchema = z.object({
+export const ExecutionTraceEventSchema = z.object({
+  from: z.string().min(1),
+  to: z.string().min(1),
+  label: z.string(),
+  kind: z.enum(['call', 'return'])
+});
+
+export type ExecutionTraceEvent = z.infer<typeof ExecutionTraceEventSchema>;
+
+const MetadataSchema = z.object({
+  analyzedAt: z.string().datetime(),
+  duration: z.number().finite().nonnegative(),
+  agentVersions: z.record(z.string().min(1))
+});
+
+/**
+ * Report shape the model must return. Kept separate so host-only metadata (the execution trace)
+ * is not part of the structured-output contract sent to Claude.
+ */
+const ModelReviewReportSchema = z.object({
   pullRequest: z.object({
     owner: z.string().min(1),
     repo: z.string().min(1),
@@ -35,10 +54,16 @@ export const ReviewReportSchema = z.object({
     description: z.string().min(1),
     files: z.array(z.string().min(1))
   })),
-  metadata: z.object({
-    analyzedAt: z.string().datetime(),
-    duration: z.number().finite().nonnegative(),
-    agentVersions: z.record(z.string().min(1))
+  metadata: MetadataSchema
+});
+
+/**
+ * Complete Review Report Schema
+ * Aggregates all subagent results into a unified report, plus the host-recorded execution trace.
+ */
+export const ReviewReportSchema = ModelReviewReportSchema.extend({
+  metadata: MetadataSchema.extend({
+    executionTrace: z.array(ExecutionTraceEventSchema).optional()
   })
 });
 
@@ -55,11 +80,21 @@ const toJsonSchema = (schema: z.ZodTypeAny): JsonSchema =>
   ) as JsonSchema;
 
 /**
+ * Removes `format` keywords. Claude Code compiles the structured-output schema with Ajv in strict mode and no
+ * format plugins; an unknown format such as "date-time" fails compilation and the CLI then silently drops the
+ * StructuredOutput tool. Formats are still enforced by the Zod schema when the host parses the result.
+ */
+const withoutFormats = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(withoutFormats);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key, entry]) => !(key === 'format' && typeof entry === 'string'))
+    .map(([key, entry]) => [key, withoutFormats(entry)]));
+};
+
+/**
  * JSON Schema for SDK structured outputs
  * Per SDK docs: https://platform.claude.com/docs/en/agent-sdk/structured-outputs
  * Use $refStrategy: 'root' to properly inline all $ref definitions
  */
-const rawSchema: JsonSchema = toJsonSchema(ReviewReportSchema);
-
-// Extract the actual schema - zodToJsonSchema may wrap it with extra properties
-export const ReviewReportJSONSchema = rawSchema;
+export const ReviewReportJSONSchema = withoutFormats(toJsonSchema(ModelReviewReportSchema)) as JsonSchema;
